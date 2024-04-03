@@ -5,6 +5,9 @@
 	.abs
 	.org	0
 
+COPRO	.equ	0x08
+COPRORUN .equ	0x0C
+
 rst0:
 	di
 	ld	sp,0xFFFF
@@ -176,7 +179,6 @@ ns16x50func:
 ns16x50out:
 	ld	b,a
 ns16x50outw:	
-	; Do we need the wait here FIXME
 	in	a,(0xA5)
 	and	0x20
 	jr	z,ns16x50outw
@@ -231,7 +233,7 @@ siopoll:
 	and	1
 	ret
 sioopoll:
-	in	a,(080h)
+	in	a,(0x80)
 	and	4
 	ret
 ;
@@ -300,7 +302,7 @@ const2:
 	call	jphl
 	pop	ix
 	ld	a,0
-	ret	z
+	ret	nz
 	dec	a
 	ret
 
@@ -318,11 +320,199 @@ main:
 	.ascii	"tched Pixels ECP180"
 	.byte	13,10,13,10,0
 
-moo:	jp	moo
+	;	Now check the card is present at 0x08
+	ld	bc,COPRO
+	ld	a,0x55
+	out	(c),a
+	in	e,(c)
+	cp	e
+	jr	nz, no_card
+	cpl
+	out	(c),a
+	in	e,(c)
+	cp	e
+	jr	nz, no_card
+	inc	b
+	cpl
+	out	(c),a
+	cpl
+	dec	b
+	in	e,(c)
+	cp	a
+	jr	nz, no_card
+	;	Ok looks good
 
+	rst	0x20
+	.ascii	'ECP180 Present at 0x08'
+	.byte	13,10,0
 
+	ld	hl,loader
+	ld	bc,COPRO
+	; Load 256 bytes
+put_loader:
+	ld	a,(hl)
+	inc	hl
+	out	(c),a
+	inc	b
+	jr	nz, put_loader
+
+	rst	0x20
+	.ascii	'Starting coprocessor card'
+	.byte	13,10,0
+
+	;	Start coprocessor and poll for it to be ready
+	ld	bc,COPRORUN+768		; byte 3
+copro_wait:
+	in	a,(c)
+	cp	0xFF			; wait for the coprocessor to set it
+	jr	nz, copro_wait
+	;	Coprocessor is live and running the loader
+
+	rst	0x20
+	.ascii	'Uploading firmware'
+	.byte	0
+	.byte	13,10,0
+
+copro_upload:
+	ld	hl,firmware
+	ld	d,32			; loading 8K
+	ld	bc,COPRORUN+512		; byte 2
+	out	(c),d			; counter for blocks
+
+	;	We keep writing pages to the chip
+	ld	bc,COPRORUN+1		; second page
+up_next:
+	ld	a,(hl)
+	inc	hl
+	out	(c),a			; write a byte
+	inc	b			; move on
+	jr	nz, up_next
+	push	bc
+	ld	bc,COPRORUN+768
+	; CPU set this to FF, write our ready token
+	xor	a
+	out	(c),a
+	ld	a,'.'
+	rst	8
+upl_wait:
+	in	a,(c)
+	cp	0xAA			; started ?? oops
+	jr	z, copro_run
+	inc	a			; FF ?
+	jr	nz, upl_wait
+	pop	bc
+	; Block uploaded correctly
+	jr	up_next
+
+copro_run:
+	rst	0x20
+	.byte	13,10
+	.ascii	'Firmware is running'
+	.byte	13,10,0
+
+;
+;	Now become a glass tty
+;
+terminal:
+	ld	bc,COPRORUN
+term_next:
+	in	a,(c)
+	or	a
+	jr	z, no_out
+	rst	8
+	xor	a
+	out	(c),a		; indicate done
+no_out:
+	inc	b
+	in	a,(c)
+	or	a
+	jr	nz, terminal
+	rst	0x18
+	inc	a
+	jr	z, terminal
+	rst	0x10
+	out	(c),a		; key to copro
+	jr	terminal
+
+no_card:
+	rst	0x20
+	.ascii	'No ECP180 detected at 0x08'
+	.byte	13,10,0
+fail:
+	ld	a,#0xF0
+	out	(0),a
+	jp	fail
+
+;
+;	This block is loaded at 0 on the coprocessor. Keep relocatable
+;
+	.z180
+
+loader:
+	jr	runld
+	.word	0		; control flags
+runld:
+	;	Map the upper memory to private memory space
+	;	CBR 0x38 BBR 0x39 CBAR 0x3A
+	ld	a,0x80
+	out0	(0x38),a	; 0x8000 up generates 0x80000 + addr
+				; ie 0x8000 is "0x8000 in the private RAM
+				; This will be fine for uploading stuff like
+				; CP/M
+	ld	a,0x88		; 0000-7FFF direct mapped
+	out0	(0x3A),a	; 8000-FFFF mapped as common area 1
+	;	Now do the transfers
+	ld	de,0xE000	; Loading to E000-FFFF in SRAM (TODO unhardcode)
+	exx
+	ld	de,3
+	ld	hl,2
+nextblock:
+	ld	a,0xFF
+	ld	(de),a		; indicate ready
+waitblock:
+	ld	a,(de)
+	inc	a
+	jr	z, waitblock
+	; 0x01xx is a block to upload into main RAM
+	exx
+	ld	hl,0x0100
+	ld	b,h
+	ld	c,l
+	ldir
+	exx
+	; Are we there yet ?
+	dec	(hl)
+	jr	nz, nextblock
+	; Indicate we are go
+	ld	a,0xAA
+	ld	(de),a
+	; Run the uploaded code
+	jp	0xE000
+
+	.org	0x0300
+firmware:
+	; Appended here but test code for now
+	xor	a
+	ld	(0),a
+	ld	a,'*'
+	ld	(1),a
+kwt:
+	ld	a,(1)		; char from kbd ?
+	or	a
+	jr	z,kwt
+	ld	c,a
+kwto:
+	ld	a,(0)		; wait for out buffer
+	or	a
+	jr	nz,kwto
+	ld	a,c
+	ld	(0),a		; write it, other end will clear byte when done
+	xor	a
+	ld	(1),a		; tell the console we ate the char
+	jr	kwt
 
 	.org	0x8000
 	; RAM (not initialized)
 confunc:
 	.word	0
+
